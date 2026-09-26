@@ -135,9 +135,14 @@ fn run_writer() -> i32 {
         // 永不成立，run4 实测。标记文件是**进程间**对账通道，
         // 与内核内部计数解耦（S20：失败模式先行）。
         let mpath: &str = if seg == 0 { "/tmp/ce2e_seg0" } else { "/tmp/ce2e_seg1" };
-        let mfd = match open(mpath, OpenFlags::WRITE_ONLY, Permissions::read_write()) {
+        // 标记文件此前不存在：WRITE_ONLY 的 create=false 会 NotFound
+        //（sys_open 只在 flags.create 时创建——run5 实测，status
+        // read_pos=12 证明消费已发生、标记却缺失）。写标记必须
+        // CREATE_OR_TRUNCATE（shell 后台重定向同款）。
+        let mfd = match open(mpath, OpenFlags::CREATE_OR_TRUNCATE, Permissions::read_write()) {
             Ok(f) => f,
             Err(_) => {
+                outln(b"[ce2e-w] FATAL: marker open failed");
                 let _ = close(fd);
                 return 14;
             }
@@ -145,16 +150,9 @@ fn run_writer() -> i32 {
         let _ = write(mfd, b"ok");
         let _ = close(mfd);
     }
-    // 两段都正确：写 PASS 标记文件（consumer 对账）。
-    let mark = match open("/tmp/consoled_e2e.pass", OpenFlags::WRITE_ONLY, Permissions::read_write()) {
-        Ok(f) => f,
-        Err(_) => {
-            let _ = close(fd);
-            return 13;
-        }
-    };
-    let _ = write(mark, b"ok");
-    let _ = close(mark);
+    // 两段标记均已落盘（seg0/seg1）= 消费与校验的完整证据链；
+    // consumer 以 seg1 标记为最终对账点（单一事实源，S13），
+    // 这里不再写第二个总标记。
     let _ = close(fd);
     0
 }
