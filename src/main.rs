@@ -56,35 +56,6 @@ fn outln(b: &[u8]) {
     out(b"\n");
 }
 
-/// 文件日志：每步落一行到 /users/alice/ce2e_<role>.log（追加语义：
-/// CREATE_OR_TRUNCATE 会清档，故本程序不用它做日志——打开
-/// READ_ONLY 探测存在性后再决定建档；简化：每次 open 用
-/// WRITE_ONLY|create（存在则从头写覆盖，日志价值靠「本进程
-/// 独占该文件」保住——两角色各写各的日志，不共享）。
-/// **为什么不用 stdout**：后台 stdout 重定向链（shell > /tmp/jobN.out）
-/// 与 /tmp 别名解析有未验证交集，run7-8 jobout 空输出已证此通道
-/// 不可靠。文件日志是唯一「写端亲笔」证据（S09）。
-fn flog(path: &str, msg: &[u8]) {
-    // 追加语义：append+create+write（结构体字面量——libsys 无命名
-    // APPEND 常量；位集与内核 O_ 语义一一对应）。
-    let flags = OpenFlags {
-        read: false,
-        write: true,
-        create: true,
-        truncate: false,
-        append: true,
-        directory: false,
-        pipe: false,
-    };
-    let fd = match open(path, flags, Permissions::read_write()) {
-        Ok(f) => f,
-        Err(_) => return, // 日志失败不影响主流程（不能因取证失败而失败）
-    };
-    let _ = write(fd, msg);
-    let _ = write(fd, b"\n");
-    let _ = close(fd);
-}
-
 
 /// 打开 console 读端。
 fn open_reader() -> Result<u64, Error> {
@@ -139,21 +110,17 @@ fn read_status() -> Result<alloc::vec::Vec<u8>, Error> {
     Ok(buf)
 }
 
-/// writer 角色：阻塞读 → 校验 ×2 段 → PASS 标记。
-/// 全程不打印中间态（后台输出进 /tmp/jobN.out，打印无意义）。
+/// writer 角色（roundtrip 的子进程）：阻塞读 → 逐段校验 → 退出码 0。
+/// stdout 继承父进程 → 串口可见；失败路径全部**打印后退出**（S09：
+/// run7 教训——静默退出码无法从串口区分故障形态）。
 fn run_writer() -> i32 {
-    // 失败路径全部**打印后退出**（S09）：后台 stdout 进 /tmp/jobN.out，
-    // 验收脚本经 `jobout N` 取证。静默退出码 = 不可诊断（run7 教训：
-    // read_pos 前进而标记缺失，退出码无法从串口区分是 11 还是 12）。
     let fd = match open_reader() {
         Ok(f) => f,
         Err(_) => {
-            flog("/users/alice/ce2e_writer.log", b"exit 10: open reader failed");
             outln(b"[ce2e-w] exit 10: open reader failed");
             return 10;
         }
     };
-    flog("/users/alice/ce2e_writer.log", b"reader opened, entering loop");
     for seg in 0..2 {
         let mut got = [0u8; SEG];
         // 阻塞读：空环时内核登记 CONSOLE_WAITER 并挂起本进程——
@@ -177,10 +144,8 @@ fn run_writer() -> i32 {
                 }
             }
         }
-        flog("/users/alice/ce2e_writer.log", b"segment read complete, validating");
         for k in 0..SEG {
             if got[k] != pattern(seg, k) {
-                flog("/users/alice/ce2e_writer.log", b"exit 12: byte mismatch");
                 out(b"[ce2e-w] exit 12: byte mismatch seg=");
                 out_u64(seg as u64);
                 out(b" off=");
@@ -194,38 +159,10 @@ fn run_writer() -> i32 {
                 return 12; // 字节错——数据链路坏
             }
         }
-        // 每段过验即落标记：consumer 据此推进（不依赖 status 水位——
-        // 环是共享的，第三人（consoled）的写入会让「绝对水位归零」
-        // 永不成立，run4 实测。标记文件是**进程间**对账通道，
-        // 与内核内部计数解耦（S20：失败模式先行）。
-        let mpath: &str = if seg == 0 { "/users/alice/ce2e_seg0" } else { "/users/alice/ce2e_seg1" };
-        // 标记放 alice 家目录（userd 1000:1000 所属，**对登录用户可写**）。
-        // run13 S0 探针实证：/scratch 是 0755 root:root——alice 建档
-        // EACCES（`echo > /scratch/...` 静默失败、cat ENOENT），
-        // 而 /tmp 又是它的 symlink——run5-12 的标记失踪、jobout
-        // 空输出，全部同根：**写入目录对登录用户不可写**。家目录是
-        // 身份正确的可写区（S17：默认落可证实的可写地）。
-        // 标记文件此前不存在：WRITE_ONLY 的 create=false 会 NotFound
-        //（sys_open 只在 flags.create 时创建——run5 实测，status
-        // read_pos=12 证明消费已发生、标记却缺失）。写标记必须
-        // CREATE_OR_TRUNCATE（shell 后台重定向同款）。
-        let mfd = match open(mpath, OpenFlags::CREATE_OR_TRUNCATE, Permissions::read_write()) {
-            Ok(f) => f,
-            Err(_) => {
-                outln(b"[ce2e-w] exit 14: marker open failed");
-                let _ = close(fd);
-                return 14;
-            }
-        };
-        let _ = write(mfd, b"ok");
-        let _ = close(mfd);
-        flog("/users/alice/ce2e_writer.log", b"marker written");
+        // 本段过验 → 继续下一段（对账由父进程 waitpid 收整体退出码，
+        // run18 实测该通道精确可靠）。
     }
-    // 两段标记均已落盘（seg0/seg1）= 消费与校验的完整证据链；
-    // consumer 以 seg1 标记为最终对账点（单一事实源，S13），
-    // 这里不再写第二个总标记。
     outln(b"[ce2e-w] both segments validated");
-    flog("/users/alice/ce2e_writer.log", b"done");
     let _ = close(fd);
     0
 }
