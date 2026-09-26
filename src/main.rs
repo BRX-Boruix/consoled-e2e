@@ -22,7 +22,7 @@
 #![no_main]
 extern crate alloc;
 
-use libsys::{close, open, read, write, Error, OpenFlags, Permissions, STDOUT};
+use libsys::{close, kill, open, read, waitpid_any_timeout, write, Error, OpenFlags, Permissions, STDOUT, Task};
 
 /// 两段测试 pattern：跨 0/255 边界、周期性、段间不同（次序错乱必暴露）。
 fn pattern(seg: usize, i: usize) -> u8 {
@@ -230,92 +230,73 @@ fn run_writer() -> i32 {
     0
 }
 
-/// 有界轮询一个标记文件的出现与内容 ok（进程间对账通道）。
-fn wait_marker(path: &str) -> bool {
-    for _ in 0..200_000 {
-        match open(path, OpenFlags::READ_ONLY, Permissions::readonly()) {
-            Ok(mfd) => {
-                let mut b = [0u8; 8];
-                let n = read(mfd, &mut b).unwrap_or(0);
-                let _ = close(mfd);
-                if &b[..n] == b"ok" {
-                    return true;
-                }
-            }
-            Err(_) => {}
-        }
-        let _ = libsys::yield_now();
-    }
-    false
-}
 
-/// consumer 角色：等 writer 挂起 → 写两段 → 对账 → 收尸。
+/// roundtrip 父角色：spawn writer 子进程 → 写两段 → waitpid 收退出码。
+///
+/// **为何弃用文件标记握手（run5-16 实测链）**：交互 shell 的真实身份是
+/// init 派生的 System(uid=1)（提示符的 "alice" 只是 login 流程变量，
+/// S09 证据：cat /users/alice/identity EACCES、/scratch 建档失败、
+/// 家目录建档 EACCES）——uid1 对 /scratch(0755 root:root)、
+/// /users/alice(alice 0700) 均无写权，**没有任何常规共享可写目录**；
+/// 文件握手在身份地形上不可行。waitpid 退出码是内核保证的进程间
+/// 交付通道（C7.1 已登记 ppid），不依赖文件系统权限（S20）。
 fn run_consumer() -> i32 {
-    // 1. 拉起 writer（后台）：exec 替换自己会毁掉本角色——用 shell 语义不在
-    //    库里；本程序由验收脚本以两阶段方式驱动（见下），此函数只做
-    //    「写端注入 + 对账」，writer 由脚本先经 `consoled-e2e writer &` 拉起。
-    //    故本函数不 spawn；它假设 writer 已在阻塞读。
-
-    // 2. 写第一段：此写发生在 writer 已阻塞（或即将阻塞）时——
-    //    唤醒链路就此被真实触发。写后水位必须 = SEG。
+    // 1. spawn writer 子进程（自我派生，路径模式）。子进程立即阻塞在
+    //    console 空环上（登记 CONSOLE_WAITER）。
+    let child = match Task::spawn("/programs/consoled-e2e.elf", &["writer"]) {
+        Ok(pid) => pid,
+        Err(_) => {
+            outln(b"[ce2e] FAIL: spawn writer child failed");
+            return 30;
+        }
+    };
+    // 2. 写两段 pattern（子进程被逐段唤醒消费）。写端由本进程持有——
+    //    子进程只读，写入-唤醒-消费-校验全链路在真实进程对之间完成。
     let wfd = match open_writer() {
         Ok(f) => f,
         Err(_) => {
-            flog("/users/alice/ce2e_consumer.log", b"exit 20: open writer failed");
+            outln(b"[ce2e] FAIL: open writer end failed");
+            let _ = kill(child as u64, 9);
             return 20;
         }
     };
-    flog("/users/alice/ce2e_consumer.log", b"consumer entered, writer fd open");
-    let seg0: alloc::vec::Vec<u8> = (0..SEG).map(|i| pattern(0, i)).collect();
-    match write(wfd, &seg0) {
-        Ok(n) if n == SEG => {}
-        Ok(_) => {
-            // 环被别的东西占着？P4 前环是独占实验场——短写=异常。
-            let _ = close(wfd);
-            return 21;
+    for seg in 0..2usize {
+        let segb: alloc::vec::Vec<u8> = (0..SEG).map(|i| pattern(seg, i)).collect();
+        match write(wfd, &segb) {
+            Ok(n) if n == SEG => {}
+            _ => {
+                out(b"[ce2e] FAIL: seg");
+                out_u64(seg as u64);
+                outln(b" short write");
+                let _ = kill(child as u64, 9);
+                let _ = close(wfd);
+                return 21 + seg as i32;
+            }
         }
-        Err(_) => {
-            let _ = close(wfd);
-            return 22;
-        }
-    }
-    // writer 收到 seg0 并逐字节校验后落 /tmp/ce2e_seg0 标记——
-    // **不**等 status 水位归零：环是共享的，第三写者的字节会让
-    // 「绝对水位归零」永不成立（run4 实测教训）。标记文件是
-    // 进程间对账通道，与内核内部计数解耦（S20）。
-    flog("/users/alice/ce2e_consumer.log", b"seg0 written, waiting marker");
-    if !wait_marker("/users/alice/ce2e_seg0") {
-        flog("/users/alice/ce2e_consumer.log", b"exit 23: seg0 marker timeout");
-        outln(b"[ce2e] FAIL: seg0 marker never appeared (writer stuck?)");
-        let _ = close(wfd);
-        return 23;
-    }
-
-    // 3. 写第二段（跨 0x80 边界的第二 pattern），同样等标记。
-    let seg1: alloc::vec::Vec<u8> = (0..SEG).map(|i| pattern(1, i)).collect();
-    match write(wfd, &seg1) {
-        Ok(n) if n == SEG => {}
-        _ => {
-            let _ = close(wfd);
-            return 24;
-        }
-    }
-    flog("/users/alice/ce2e_consumer.log", b"seg1 written, waiting marker");
-    if !wait_marker("/users/alice/ce2e_seg1") {
-        flog("/users/alice/ce2e_consumer.log", b"exit 25: seg1 marker timeout");
-        outln(b"[ce2e] FAIL: seg1 marker never appeared");
-        let _ = close(wfd);
-        return 25;
     }
     let _ = close(wfd);
+    // 3. waitpid 收 writer 退出码：0 = 两段逐字节校验全过
+    //    （park/wake 往返 + 字节完整性一次判定）。
+    let wr = match waitpid_any_timeout(30_000_000_000) {
+        Ok(w) if w.pid == child => w.code,
+        Ok(_) => {
+            outln(b"[ce2e] FAIL: unexpected child exited first");
+            return 32;
+        }
+        Err(_) => {
+            outln(b"[ce2e] FAIL: writer did not exit in 30s");
+            let _ = kill(child as u64, 9);
+            return 33;
+        }
+    };
+    if wr != 0 {
+        out(b"[ce2e] FAIL: writer exit code ");
+        out_u64(wr as u64);
+        outln(b"");
+        return 34;
+    }
 
-    // 4. 两段标记都已就位 = writer 逐字节校验全过（对账已在
-    //    wait_marker 内完成；writer 的最终退出码经 waitpid 收，
-    //    这里不再重复一个总标记文件——单一事实源，S13）。
-    let pass = true;
-    let _ = pass;
-
-    // 5. 收尾：终态 status 对账（真实遥测，S09）——writes>=2 且 dropped 稳定。
+    // 4. 终态遥测对账（S09）：两段至少两次写入。
     let buf = match read_status() {
         Ok(b) => b,
         Err(_) => return 27,
@@ -328,7 +309,6 @@ fn run_consumer() -> i32 {
     outln(b"[ce2e] PASS (roundtrip park/wake + byte integrity)");
     0
 }
-
 #[unsafe(no_mangle)]
 pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     if argc < 1 || argv.is_null() {
@@ -351,7 +331,10 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     };
     if role == "writer" {
         run_writer()
-    } else if role == "consumer" {
+    } else if role == "roundtrip" {
+        run_consumer()
+    } else if role.ends_with("consoled-e2e") {
+        // 无参启动：默认跑 roundtrip（writer 子进程派生在此处发生）。
         run_consumer()
     } else {
         out(b"[ce2e] usage: consoled-e2e writer|consumer (got ");
