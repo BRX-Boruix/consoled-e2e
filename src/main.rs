@@ -130,6 +130,20 @@ fn run_writer() -> i32 {
                 return 12; // 字节错——数据链路坏
             }
         }
+        // 每段过验即落标记：consumer 据此推进（不依赖 status 水位——
+        // 环是共享的，第三人（consoled）的写入会让「绝对水位归零」
+        // 永不成立，run4 实测。标记文件是**进程间**对账通道，
+        // 与内核内部计数解耦（S20：失败模式先行）。
+        let mpath: &str = if seg == 0 { "/tmp/ce2e_seg0" } else { "/tmp/ce2e_seg1" };
+        let mfd = match open(mpath, OpenFlags::WRITE_ONLY, Permissions::read_write()) {
+            Ok(f) => f,
+            Err(_) => {
+                let _ = close(fd);
+                return 14;
+            }
+        };
+        let _ = write(mfd, b"ok");
+        let _ = close(mfd);
     }
     // 两段都正确：写 PASS 标记文件（consumer 对账）。
     let mark = match open("/tmp/consoled_e2e.pass", OpenFlags::WRITE_ONLY, Permissions::read_write()) {
@@ -145,19 +159,19 @@ fn run_writer() -> i32 {
     0
 }
 
-/// 轮询直到 status 里 used 字段 == want（有界；超时返回 false）。
-fn wait_status_used(want: u64, max_polls: u64) -> bool {
-    for _ in 0..max_polls {
-        if let Ok(buf) = read_status() {
-            if let Ok(used) = json_field(&buf, b"used") {
-                if used == want {
+/// 有界轮询一个标记文件的出现与内容 ok（进程间对账通道）。
+fn wait_marker(path: &str) -> bool {
+    for _ in 0..200_000 {
+        match open(path, OpenFlags::READ_ONLY, Permissions::readonly()) {
+            Ok(mfd) => {
+                let mut b = [0u8; 8];
+                let n = read(mfd, &mut b).unwrap_or(0);
+                let _ = close(mfd);
+                if &b[..n] == b"ok" {
                     return true;
                 }
-                // 水位越过目标（不该发生）：立即失败，不等超时。
-                if used > want {
-                    return false;
-                }
             }
+            Err(_) => {}
         }
         let _ = libsys::yield_now();
     }
@@ -190,14 +204,17 @@ fn run_consumer() -> i32 {
             return 22;
         }
     }
-    // writer 被唤醒消费第一段前，水位短暂 = SEG；等它归零（被读走）。
-    if !wait_status_used(0, 200_000) {
-        outln(b"[ce2e] FAIL: seg0 not consumed (used never back to 0)");
+    // writer 收到 seg0 并逐字节校验后落 /tmp/ce2e_seg0 标记——
+    // **不**等 status 水位归零：环是共享的，第三写者的字节会让
+    // 「绝对水位归零」永不成立（run4 实测教训）。标记文件是
+    // 进程间对账通道，与内核内部计数解耦（S20）。
+    if !wait_marker("/tmp/ce2e_seg0") {
+        outln(b"[ce2e] FAIL: seg0 marker never appeared (writer stuck?)");
         let _ = close(wfd);
         return 23;
     }
 
-    // 3. 写第二段（跨 0x80 边界的第二 pattern），同样等消费。
+    // 3. 写第二段（跨 0x80 边界的第二 pattern），同样等标记。
     let seg1: alloc::vec::Vec<u8> = (0..SEG).map(|i| pattern(1, i)).collect();
     match write(wfd, &seg1) {
         Ok(n) if n == SEG => {}
@@ -206,34 +223,18 @@ fn run_consumer() -> i32 {
             return 24;
         }
     }
-    if !wait_status_used(0, 200_000) {
-        outln(b"[ce2e] FAIL: seg1 not consumed");
+    if !wait_marker("/tmp/ce2e_seg1") {
+        outln(b"[ce2e] FAIL: seg1 marker never appeared");
         let _ = close(wfd);
         return 25;
     }
     let _ = close(wfd);
 
-    // 4. 对账 PASS 标记（writer 两段校验都过的唯一证据）。
-    let mut pass = false;
-    for _ in 0..200_000 {
-        match open("/tmp/consoled_e2e.pass", OpenFlags::READ_ONLY, Permissions::readonly()) {
-            Ok(mfd) => {
-                let mut b = [0u8; 8];
-                let n = read(mfd, &mut b).unwrap_or(0);
-                let _ = close(mfd);
-                if &b[..n] == b"ok" {
-                    pass = true;
-                    break;
-                }
-            }
-            Err(_) => {}
-        }
-        let _ = libsys::yield_now();
-    }
-    if !pass {
-        outln(b"[ce2e] FAIL: writer PASS marker never appeared");
-        return 26;
-    }
+    // 4. 两段标记都已就位 = writer 逐字节校验全过（对账已在
+    //    wait_marker 内完成；writer 的最终退出码经 waitpid 收，
+    //    这里不再重复一个总标记文件——单一事实源，S13）。
+    let pass = true;
+    let _ = pass;
 
     // 5. 收尾：终态 status 对账（真实遥测，S09）——writes>=2 且 dropped 稳定。
     let buf = match read_status() {
@@ -245,6 +246,7 @@ fn run_consumer() -> i32 {
         outln(b"[ce2e] FAIL: writes counter regressed");
         return 28;
     }
+    outln(b"[ce2e] PASS (roundtrip park/wake + byte integrity)");
     0
 }
 
