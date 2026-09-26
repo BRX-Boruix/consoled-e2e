@@ -36,6 +36,21 @@ fn out(b: &[u8]) {
     let _ = write(STDOUT, b);
 }
 
+fn out_u64(mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    if v == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    }
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    out(&buf[i..]);
+}
+
 fn outln(b: &[u8]) {
     out(b);
     out(b"\n");
@@ -98,9 +113,15 @@ fn read_status() -> Result<alloc::vec::Vec<u8>, Error> {
 /// writer 角色：阻塞读 → 校验 ×2 段 → PASS 标记。
 /// 全程不打印中间态（后台输出进 /tmp/jobN.out，打印无意义）。
 fn run_writer() -> i32 {
+    // 失败路径全部**打印后退出**（S09）：后台 stdout 进 /tmp/jobN.out，
+    // 验收脚本经 `jobout N` 取证。静默退出码 = 不可诊断（run7 教训：
+    // read_pos 前进而标记缺失，退出码无法从串口区分是 11 还是 12）。
     let fd = match open_reader() {
         Ok(f) => f,
-        Err(_) => return 10,
+        Err(_) => {
+            outln(b"[ce2e-w] exit 10: open reader failed");
+            return 10;
+        }
     };
     for seg in 0..2 {
         let mut got = [0u8; SEG];
@@ -119,6 +140,7 @@ fn run_writer() -> i32 {
                     let _ = libsys::yield_now();
                 }
                 Err(_) => {
+                    outln(b"[ce2e-w] exit 11: read error");
                     let _ = close(fd);
                     return 11;
                 }
@@ -126,6 +148,15 @@ fn run_writer() -> i32 {
         }
         for k in 0..SEG {
             if got[k] != pattern(seg, k) {
+                out(b"[ce2e-w] exit 12: byte mismatch seg=");
+                out_u64(seg as u64);
+                out(b" off=");
+                out_u64(k as u64);
+                out(b" got=");
+                out_u64(got[k] as u64);
+                out(b" want=");
+                out_u64(pattern(seg, k) as u64);
+                outln(b"");
                 let _ = close(fd);
                 return 12; // 字节错——数据链路坏
             }
@@ -142,7 +173,7 @@ fn run_writer() -> i32 {
         let mfd = match open(mpath, OpenFlags::CREATE_OR_TRUNCATE, Permissions::read_write()) {
             Ok(f) => f,
             Err(_) => {
-                outln(b"[ce2e-w] FATAL: marker open failed");
+                outln(b"[ce2e-w] exit 14: marker open failed");
                 let _ = close(fd);
                 return 14;
             }
@@ -153,6 +184,7 @@ fn run_writer() -> i32 {
     // 两段标记均已落盘（seg0/seg1）= 消费与校验的完整证据链；
     // consumer 以 seg1 标记为最终对账点（单一事实源，S13），
     // 这里不再写第二个总标记。
+    outln(b"[ce2e-w] both segments validated");
     let _ = close(fd);
     0
 }
