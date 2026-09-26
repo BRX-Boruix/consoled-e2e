@@ -56,7 +56,7 @@ fn outln(b: &[u8]) {
     out(b"\n");
 }
 
-/// 文件日志：每步落一行到 /scratch/ce2e_<role>.log（追加语义：
+/// 文件日志：每步落一行到 /users/alice/ce2e_<role>.log（追加语义：
 /// CREATE_OR_TRUNCATE 会清档，故本程序不用它做日志——打开
 /// READ_ONLY 探测存在性后再决定建档；简化：每次 open 用
 /// WRITE_ONLY|create（存在则从头写覆盖，日志价值靠「本进程
@@ -148,12 +148,12 @@ fn run_writer() -> i32 {
     let fd = match open_reader() {
         Ok(f) => f,
         Err(_) => {
-            flog("/scratch/ce2e_writer.log", b"exit 10: open reader failed");
+            flog("/users/alice/ce2e_writer.log", b"exit 10: open reader failed");
             outln(b"[ce2e-w] exit 10: open reader failed");
             return 10;
         }
     };
-    flog("/scratch/ce2e_writer.log", b"reader opened, entering loop");
+    flog("/users/alice/ce2e_writer.log", b"reader opened, entering loop");
     for seg in 0..2 {
         let mut got = [0u8; SEG];
         // 阻塞读：空环时内核登记 CONSOLE_WAITER 并挂起本进程——
@@ -177,10 +177,10 @@ fn run_writer() -> i32 {
                 }
             }
         }
-        flog("/scratch/ce2e_writer.log", b"segment read complete, validating");
+        flog("/users/alice/ce2e_writer.log", b"segment read complete, validating");
         for k in 0..SEG {
             if got[k] != pattern(seg, k) {
-                flog("/scratch/ce2e_writer.log", b"exit 12: byte mismatch");
+                flog("/users/alice/ce2e_writer.log", b"exit 12: byte mismatch");
                 out(b"[ce2e-w] exit 12: byte mismatch seg=");
                 out_u64(seg as u64);
                 out(b" off=");
@@ -198,10 +198,13 @@ fn run_writer() -> i32 {
         // 环是共享的，第三人（consoled）的写入会让「绝对水位归零」
         // 永不成立，run4 实测。标记文件是**进程间**对账通道，
         // 与内核内部计数解耦（S20：失败模式先行）。
-        let mpath: &str = if seg == 0 { "/scratch/ce2e_seg0" } else { "/scratch/ce2e_seg1" };
-        // 标记放 /scratch 直写（acee2e 成熟绿测同款），**不放 /tmp**——
-        // /tmp 是词法别名 symlink（vfs_init），create 模式下的解析
-        // 未被任何既有测试覆盖，run5-8 标记失踪的嫌疑主犯。
+        let mpath: &str = if seg == 0 { "/users/alice/ce2e_seg0" } else { "/users/alice/ce2e_seg1" };
+        // 标记放 alice 家目录（userd 1000:1000 所属，**对登录用户可写**）。
+        // run13 S0 探针实证：/scratch 是 0755 root:root——alice 建档
+        // EACCES（`echo > /scratch/...` 静默失败、cat ENOENT），
+        // 而 /tmp 又是它的 symlink——run5-12 的标记失踪、jobout
+        // 空输出，全部同根：**写入目录对登录用户不可写**。家目录是
+        // 身份正确的可写区（S17：默认落可证实的可写地）。
         // 标记文件此前不存在：WRITE_ONLY 的 create=false 会 NotFound
         //（sys_open 只在 flags.create 时创建——run5 实测，status
         // read_pos=12 证明消费已发生、标记却缺失）。写标记必须
@@ -216,13 +219,13 @@ fn run_writer() -> i32 {
         };
         let _ = write(mfd, b"ok");
         let _ = close(mfd);
-        flog("/scratch/ce2e_writer.log", b"marker written");
+        flog("/users/alice/ce2e_writer.log", b"marker written");
     }
     // 两段标记均已落盘（seg0/seg1）= 消费与校验的完整证据链；
     // consumer 以 seg1 标记为最终对账点（单一事实源，S13），
     // 这里不再写第二个总标记。
     outln(b"[ce2e-w] both segments validated");
-    flog("/scratch/ce2e_writer.log", b"done");
+    flog("/users/alice/ce2e_writer.log", b"done");
     let _ = close(fd);
     0
 }
@@ -258,11 +261,11 @@ fn run_consumer() -> i32 {
     let wfd = match open_writer() {
         Ok(f) => f,
         Err(_) => {
-            flog("/scratch/ce2e_consumer.log", b"exit 20: open writer failed");
+            flog("/users/alice/ce2e_consumer.log", b"exit 20: open writer failed");
             return 20;
         }
     };
-    flog("/scratch/ce2e_consumer.log", b"consumer entered, writer fd open");
+    flog("/users/alice/ce2e_consumer.log", b"consumer entered, writer fd open");
     let seg0: alloc::vec::Vec<u8> = (0..SEG).map(|i| pattern(0, i)).collect();
     match write(wfd, &seg0) {
         Ok(n) if n == SEG => {}
@@ -280,9 +283,9 @@ fn run_consumer() -> i32 {
     // **不**等 status 水位归零：环是共享的，第三写者的字节会让
     // 「绝对水位归零」永不成立（run4 实测教训）。标记文件是
     // 进程间对账通道，与内核内部计数解耦（S20）。
-    flog("/scratch/ce2e_consumer.log", b"seg0 written, waiting marker");
-    if !wait_marker("/scratch/ce2e_seg0") {
-        flog("/scratch/ce2e_consumer.log", b"exit 23: seg0 marker timeout");
+    flog("/users/alice/ce2e_consumer.log", b"seg0 written, waiting marker");
+    if !wait_marker("/users/alice/ce2e_seg0") {
+        flog("/users/alice/ce2e_consumer.log", b"exit 23: seg0 marker timeout");
         outln(b"[ce2e] FAIL: seg0 marker never appeared (writer stuck?)");
         let _ = close(wfd);
         return 23;
@@ -297,9 +300,9 @@ fn run_consumer() -> i32 {
             return 24;
         }
     }
-    flog("/scratch/ce2e_consumer.log", b"seg1 written, waiting marker");
-    if !wait_marker("/scratch/ce2e_seg1") {
-        flog("/scratch/ce2e_consumer.log", b"exit 25: seg1 marker timeout");
+    flog("/users/alice/ce2e_consumer.log", b"seg1 written, waiting marker");
+    if !wait_marker("/users/alice/ce2e_seg1") {
+        flog("/users/alice/ce2e_consumer.log", b"exit 25: seg1 marker timeout");
         outln(b"[ce2e] FAIL: seg1 marker never appeared");
         let _ = close(wfd);
         return 25;
