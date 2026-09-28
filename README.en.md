@@ -1,41 +1,34 @@
 # consoled-e2e
 
-An **end-to-end acceptance program** for BORUIX, verifying that **blocking wait and wake-up round trips** on the console byte ring work in real user space.
+A BORUIX console ring end-to-end acceptance test: blocking wake-up and byte integrity of the console byte ring.
 
 [简体中文](README.md)
 
 ## What it tests
 
-The program has two roles (selected by startup argument) and runs one complete console data round trip through **real syscalls**:
+Two processes complete one round trip:
 
-| Role | Behaviour |
-| --- | --- |
-| `writer` | Background process: blocks reading the console (suspending on an empty ring) → verifies the 12-byte segment byte by byte → suspends again for the second segment → verifies → writes a PASS marker → exits |
-| `consumer` | Foreground: waits for `writer` to be ready → writes both segments → confirms the consumption watermark is back to zero and reconciles → terminates `writer` → reaps it → checks the PASS marker |
+- `writer` starts in the background and blocks reading the console — with an empty ring it is suspended and registered as a waiter
+- `consumer`, in the foreground, writes two segments of known bytes
+- After each write the waiter wakes, verifies the bytes; the waiter writes back a pass marker and exits
+- The coordinator checks the consumption watermark returned to zero, reconciles the telemetry counters, reaps the writer and checks its exit code
 
-The two test segments cross the `0`/`255` boundary and differ between segments, so **an out-of-order delivery is bound to show up**.
-
-## Why a separate program
-
-The in-kernel self-test adjusts the node and ring buffer directly and **cannot reach** two critical paths:
-
-1. **The syscall wrappers themselves** — argument packing, error code translation, user buffer validation;
-2. **A real blocking round trip** — the waiter's suspend and wake-up require a genuine process context switch, verifiable only in a user-space process with a process context.
-
-## The shape of the verdict
-
-The console service daemon is not yet resident, so the **sole writer** to the console ring is this program itself (the `writer` role). That isolates the kernel chain "writing side → waiter wake-up → reading-side delivery" into a **single-variable, decidable experiment**. Once the daemon takes over the writing side, real terminal traffic is covered by higher-level interactive acceptance instead.
+It covers two paths kernel self-tests cannot reach: the syscall wrappers themselves, and the blocking
+wake that requires a real process context switch. Nothing else writes the ring during the run,
+isolating "writer → waiter wake → reader delivery" as a single-variable experiment.
 
 ## Usage
 
-The coordinating side starts both roles (`consoled-e2e writer` and so on). The exit code is the verdict.
+The command word is `writer` or `consumer`; the two sides are coordinated by a shell builtin:
+
+```
+[ce2e] PASS (roundtrip park/wake + byte integrity)
+```
 
 ## Exit codes
 
-| Exit code | Meaning |
-| --- | --- |
-| `0` | Everything correct |
-| Non-zero | Some step failed |
+- `0` — round trip completed, bytes intact, telemetry reconciled
+- non-zero — failure; reader failed to open, byte mismatch, short write and reaping anomalies each carry their own number, named in the output
 
 ## Building
 
@@ -43,22 +36,21 @@ The coordinating side starts both roles (`consoled-e2e writer` and so on). The e
 cargo build --release
 ```
 
-## Layout
+## Repository layout
 
 ```
 consoled-e2e/
-├── Cargo.toml    # package definition
+├── Cargo.toml    # package manifest
 ├── build.rs      # injects the linker script
-├── linker.ld     # user-space section layout
+├── linker.ld     # user-space segment layout
 └── src/
-    └── main.rs   # writer and reader logic
+    └── main.rs   # the waiter and writer round trip
 ```
 
 ## Related projects
 
-- [`libsys`](https://github.com/BRX-Boruix/libsys) — provides the console syscall wrappers
 - [`consoled`](https://github.com/BRX-Boruix/consoled) — the console daemon
-- [`audioe2e`](https://github.com/BRX-Boruix/audioe2e) — the same argument for another domain
+- [`shell`](https://github.com/BRX-Boruix/shell) — coordinates the two sides
 
 ## License
 
